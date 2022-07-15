@@ -1,136 +1,199 @@
+{-# LANGUAGE FlexibleInstances #-}
 module Main where
-import Data.List (transpose)
+import Data.List (transpose, intersperse)
+import Data.Function(on)
 import Data.Maybe
---import System.Random
-import Control.Applicative (Applicative(liftA2))
+import System.Random
 
-type Grid a = Rows a
-type Tiles a = [Tile a]
+import Control.Applicative (Applicative(liftA2), Alternative ((<|>)))
+import Control.Monad.State (State, StateT (StateT), state)
+import Data.Bits (Bits(shift))
+import Control.Monad (ap, liftM)
+
+data Grid a = Grid {getGrid :: [[a]]}
+type Tiles = [Tile]
 type Pos = (Int, Int)
 
 data Move = U | R | L | D
-move2Rotations = [(R, 0), (D, 1), (L, 2), (U, 3)]
+getRotation R  = 0
+getRotation D  = 1
+getRotation L  = 2
+getRotation U  = 3
 
-type Tile = Maybe
-type Rows a = [Tiles a]
-type Columns a = [Tiles a]
+data RotationDirection = RLeft | RRight
 
-data GameState a = GameState {board :: Grid a, seed :: Int}
+type Tile = Maybe Integer
+type Rows = [Tiles]
+type Columns = [Tiles]
 
---instance Functor (GameState a) where
---    fmap f (b, s) = GameState $ f b s
+--data GState a = GState {getGrid1 :: Grid a, getGen ::  StdGen}
+data GState a = GState {getGrid1 :: a, getGen ::  StdGen}
+instance Functor GState where
+    fmap f (GState g gen) = GState (f g) gen
 
---instance Applicative (GameState a) where
---    pure b = GameState $ b (makeStdGen 1000)
+newtype GameState s = GameState {getState :: s}
+--newtype GameState s a = GameState {runState :: s -> (a,s)}
+
+newtype MState s a = MState {runState2 :: s -> (a,s)}
+--instance Functor (MState s) where
+
+{-instance Monad (MState s) where
+    (MState h) >>= f = MState $ \s -> let (a, newState) = h s
+                                          (MState g) = f a
+                                      in g newState
+-}
+
+instance Functor (GameState) where 
+    --fmap f (GameState g st) = GameState g newState
+        --where newState = f st
+    fmap = liftM
+
+instance Applicative (GameState) where
+    pure = return
+    (<*>) = ap
 
 
---instance Monad (GameState a) where
---    return = pure
+instance Monad GameState where
+    return = GameState
+    (GameState st) >>= f = f st
+    --return x= GameState id
+    --(GameState h) >>= f = GameState $ \s -> let (a,s2) =  h s
+    --                                            (GameState g) = f a
+    --                                        in g s2
 
 
+makeGrid :: (Eq a, Num a) => [[a]] -> [[Maybe a]]
+makeGrid g= fmap (\x -> if x==0 then Nothing else Just x) <$> g
 
-getTile :: Grid a -> Pos -> Tile a
-getTile g (x, y) = g !! y !! x
+instance Functor Grid where
+    fmap f (Grid g) = Grid $ fmap f <$> g
 
+instance Show (Grid Tile) where
+    show = printBoard
+
+
+printBoard :: Grid Tile -> String
+printBoard (Grid g) = concatMap ((++"\n") . printRow) g
+    where 
+        largestNum = length . show . maximum . catMaybes $ concat g
+        printRow = unwords . map (padString . maybe "_" show)
+        padding = flip subtract largestNum . length
+        padString = (++) <$> id <*> (concat . flip replicate " " . padding)
 
 sizeOfGrid :: Grid a -> Int
-sizeOfGrid rows = length rows * length (head rows)
+sizeOfGrid = (2*).length . getGrid
 
 replace :: [a] -> Int -> a -> [a]
 replace lst ind newData = before ++ [newData] ++ after
     where (before,_:after) = splitAt ind lst
 
-updateGrid :: Grid a -> Pos -> Tile a -> Grid a
-updateGrid grid (x, y) newData = replace grid y newRow
+updateGrid :: Grid Tile -> Pos -> Tile -> Grid Tile
+updateGrid (Grid grid) (x, y) newData = Grid $ replace grid y newRow
     where oldRow = grid !! y
           newRow = replace oldRow x newData
 
---pos :: Tile a -> Pos
---pos (Tile x y _) = (x, y)
 
-rows :: Grid a -> Rows a
-rows = id
 
-columns :: Grid a -> Columns a
-columns = transpose
-
-getEmptyTiles :: Grid a -> [Pos]
-getEmptyTiles grid =
-    let tileCount = sizeOfGrid grid
-    in [pos |
-       isNothing $ val $ getTile grid pos, 
-       ind <- [0 .. tileCount],
-       let pos = (tileCount `mod` ind, tileCount `div` ind)]
-
-createBoard :: Int -> Grid a
-createBoard = replicate <*> (`replicate` Tile Nothing)
-
-shiftBoard :: Grid a -> Move -> Grid a
-shiftBoard grid R = shiftBoardRight grid
-shiftBoard grid m = rotate . shiftBoardRight . rotate grid
+getEmptyTiles :: Grid Tile -> [Pos]
+getEmptyTiles (Grid grid) = fst <$> filteredGrid
     where 
-        rotations = lookup m Move2Rotations
-        rotate g = iterate rotateBoard g !! rotations
+        numRows = length grid
+        indexedGrid = zip [(x,y) | y <- [0..numRows-1], x <- [0..numRows-1]] $ concat grid
+        filteredGrid = filter (isNothing . snd) indexedGrid
 
-rotateBoard :: Grid a -> Grid a
-rotateBoard = transpose . map reverse
 
-shiftBoardRight :: Grid a -> Grid a
-shiftBoardRight = fmap shiftRowRight
+createBoard :: Int -> Grid Tile
+createBoard =  (Grid .) . replicate <*> (`replicate` Nothing)
 
-shiftRowRight :: Tiles a -> Tiles a
-shiftRowRight row = replicate emptyTiles Tile Nothing ++ tiles
-    where size = length row
-          (x:xs) = catMaybes row
-          tiles = foldl collapse [x] xs
-          collapse acc t
-            | last acc == t = acc++[(*2) <$> t2]
-            | otherwise = acc++[t1, t2]
-          emptyTiles = size - length tiles
+shiftBoard :: Move -> Grid Tile -> Grid Tile
+shiftBoard R = shiftBoardRight
+shiftBoard m = rotateRight . shiftBoardRight . rotateLeft
+    where 
+        rotations = getRotation m
+        rotate dir g = iterate (rotateBoard dir) g !! rotations
+        rotateLeft = rotate RLeft
+        rotateRight = rotate RRight
 
-addNums :: Grid a -> Int -> Grid a
-addNums grid seed = updateGrid grid pos (Just 2)
+rotateBoard :: RotationDirection -> Grid a -> Grid a
+rotateBoard RRight = Grid . transpose . reverse . getGrid
+rotateBoard RLeft = Grid . reverse . transpose . getGrid
+
+
+shiftBoardRight :: Grid Tile -> Grid Tile
+shiftBoardRight = Grid . fmap shiftRowRight . getGrid
+
+{-shiftRowRight :: Tiles -> Tiles
+shiftRowRight = (>>= (++)) <$> flip emptyTiles <*> getTiles
+    where 
+        getTiles = map Just <$> collapseRow . catMaybes
+        emptyTiles =  (flip replicate Nothing .) . subtract `on` length
+        -}
+
+shiftRowRight :: Tiles -> Tiles
+shiftRowRight row = emptyTiles ++ newTiles 
+    where 
+        newTiles = map Just <$> collapseRow . catMaybes $ row
+        emptyTiles = flip replicate Nothing $ (subtract `on` length) newTiles row
+
+
+collapseRow :: [Integer] -> [Integer]
+collapseRow (a:b:cs)
+    | a == b = a+b:collapseRow cs --With this line, [2,2,4] -> [0,4,4]
+--  | a == b = a+b:collapseRow (b:cs) Use this line if a Tile can casecade multiple times in the same movement. eg, [2,2,4] -> [0, 0, 8]
+    | otherwise = a:collapseRow (b:cs)
+collapseRow row = row
+
+
+addNums' :: Grid Tile -> Int -> Grid Tile
+addNums' grid r = updateGrid grid newTile (pure 2)
     where emptyTiles = getEmptyTiles grid
-          newTile = seed `mod` sizeOfGrid grid
-          len = length grid
-          pos = (newTile `mod` len, newTile `div` len)
+          newTileInd = r `mod` length emptyTiles
+          newTile = emptyTiles !! newTileInd
 
-gBind :: GameState a -> (GameState a -> Int -> Grid a) -> GameState a
-gBind gs@(g, seed) f = newGrid
-    where newGrid = GameState $ f gs r newSeed
-          (r, newSeed) = random seed
 
+
+addNums :: (Grid Tile, StdGen)  -> (Grid Tile, StdGen)
+addNums (g, gen) = (addNums' g r, newGen)
+    where (r, newGen) = random gen
+
+--bind :: (Grid Tile -> Grid Tile) -> ()
+          
 
 main :: IO ()
-main = do
-    let b = GameState $ createBoard $ makeStdGen 100
-        newBoard = b `gBind` addNums `gBind` addNums
-    play newBoard
+main = play . addNums . addNums $ newBoard
+        where newBoard = (createBoard 3, mkStdGen 100)
 
-play :: GameState a ->  IO ()
-play grid 
-    | emptyTiles grid == 1 = putStrLn "Game Over"
+
+play :: (Grid Tile, StdGen) ->  IO ()
+play gg@(g, gen) 
+    | length (getEmptyTiles g) == 1 = putStrLn "Game Over"
     | otherwise = do
+    putStrLn $ printBoard g
+    let (b1,g1) = addNums gg
+    putStrLn "------------"
+    putStr . printBoard $  b1
     move <- getMove
-    let 
-        b = shiftBoard grid
-        eTiles = emptyTiles b
-        b2 = b `gBind` addNums 
-    play b2
+    case move of 
+        Nothing -> putStrLn "Game Over"
+        Just m -> play (shiftBoard m b1, g1)
 
-getMove :: IO Move
+getMove :: IO (Maybe Move)
 getMove = do
-    putStrLn "Enter U, R, D, L"
+    putStrLn "Enter W, D, S, A, or Q to quit."
     inp <- getChar 
-    let out = parseMove inp
-    if out == "0"
-        then getMove
-    else
-        return out
-
+    putStrLn ""
+    maybe quit checkValid $ parseInput inp 
     where 
-    parseMove 'w' = U
-    parseMove 'a' = L
-    parseMove 's' = D
-    parseMove 'd' = R
-    parseMove _ = '0'
+        quit = return Nothing
+        checkValid = maybe getMove (return . Just)
+
+parseInput :: Char -> Maybe (Maybe Move)
+parseInput 'q' = Nothing
+parseInput inp = Just $ parseMove inp
+
+parseMove :: Char -> Maybe Move
+parseMove 'w' = Just U
+parseMove 'a' = Just L
+parseMove 's' = Just D
+parseMove 'd' = Just R
+parseMove _ = Nothing
